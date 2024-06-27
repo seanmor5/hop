@@ -56,13 +56,13 @@ defmodule Hop do
   Most users should stick to using Hop's default pre-request logic. If you want to
   customize the behavior; however, you can pass your own `prefetch/3` function:
 
-    url
-    |> Hop.new()
-    |> Hop.prefetch(fn url, _state, _opts -> {:ok, url} end)
-    |> Hop.stream()
-    |> Enum.each(fn {url, _response, _state} ->
-      IO.puts("Visited: \#{url}")
-    end)
+      url
+      |> Hop.new()
+      |> Hop.prefetch(fn url, _state, _opts -> {:ok, url} end)
+      |> Hop.stream()
+      |> Enum.each(fn {url, _response, _state} ->
+        IO.puts("Visited: \#{url}")
+      end)
 
   This simple example performs no validation, and forwards all URLs to the fetch stage.
 
@@ -149,6 +149,8 @@ defmodule Hop do
   ## State
 
   defmodule State do
+    @moduledoc false
+
     defstruct [
       :last_crawled_url,
       depth: 0,
@@ -163,6 +165,7 @@ defmodule Hop do
   @doc """
   Creates a new Hop starting at the given URL(s).
   """
+  @doc type: :builder
   def new(url, opts \\ []) when is_binary(url) or is_list(url) do
     opts = Keyword.validate!(opts, [:prefetch, :fetch, :next, :config])
 
@@ -220,6 +223,7 @@ defmodule Hop do
   simply forwarded to the `process` function. This means you can
   swap for a new HTTP-client if necessary.
   """
+  @doc type: :builder
   def fetch(%Hop{} = hop, fetch) when is_function(fetch, 3) do
     %{hop | fetch: fetch}
   end
@@ -227,11 +231,13 @@ defmodule Hop do
   @doc """
   Sets this hop's prefetch function.
 
-  The prefetch function is essentially meant to be a pre-request to
-  the given URL before fetching the entire object. Most clients
-  will want to leave this as-is. The purpose is to prevent full
-  fetches of potentially large content or undesired content types.
+  The prefetch function is essentially meant to be a pre-request
+  validation stage. This could serve the purpose of validating that
+  a given URL is valid, that the content is valid (e.g. via a HEAD
+  request), that the request matches a site's Robots.txt, etc.
+  Most clients will want to leave this as-is.
   """
+  @doc type: :builder
   def prefetch(%Hop{} = hop, prefetch) when is_function(prefetch, 3) do
     %{hop | prefetch: prefetch}
   end
@@ -242,6 +248,7 @@ defmodule Hop do
   The next function dictates which links are meant to be crawled
   next after the current page.
   """
+  @doc type: :builder
   def next(%Hop{} = hop, next) when is_function(next, 4) do
     %{hop | next: next}
   end
@@ -252,6 +259,7 @@ defmodule Hop do
   Puts the given configuration value for the given key
   in the given hop.
   """
+  @doc type: :configuration
   def put_config(%Hop{config: config} = hop, key, value) do
     %{hop | config: Keyword.put(config, key, value)}
   end
@@ -260,10 +268,13 @@ defmodule Hop do
   Returns the current configuration value set for the given
   key in the Hop.
   """
+  @doc type: :configuration
   def config(%Hop{config: config}, key) do
     config[key] || default_config(key)
   end
 
+  @doc false
+  def default_config(key)
   def default_config(:max_depth), do: @default_max_depth
   def default_config(:max_content_length), do: @default_max_content_length
   def default_config(:accepted_schemes), do: @default_accepted_schemes
@@ -281,6 +292,7 @@ defmodule Hop do
   the given start URL, and lazily return tuples of `{url, response, state}`
   for each successfully visited page.
   """
+  @doc type: :execution
   def stream(%Hop{url: url} = hop, state \\ %State{}) do
     max_depth = config(hop, :max_depth)
 
@@ -333,7 +345,8 @@ defmodule Hop do
   The Crawl state contains a member `:visited` that is populated with
   a set of URLs that have already been visited.
   """
-  def validate_visited({:ok, url}, %{visited: visited}, _opts) when is_binary(url) do
+  @doc type: :validator
+  def validate_visited({:ok, url}, %{visited: visited} = _state, _opts) when is_binary(url) do
     if MapSet.member?(visited, url) do
       {:error, :already_visited}
     else
@@ -350,6 +363,7 @@ defmodule Hop do
   one of the configured accepted schemes according to the `:accepted_schemes`
   configuration option.
   """
+  @doc type: :validator
   def validate_scheme({:ok, url}, _state, opts) do
     accepted_schemes = opts[:accepted_schemes]
     %URI{scheme: scheme} = URI.parse(url)
@@ -369,7 +383,8 @@ defmodule Hop do
   Validates that the hostname is populated, correct, and falls within
   the set of hostnames allowed according to the crawl state.
   """
-  def validate_hostname({:ok, url}, %{hostnames: hostnames}, _opts) do
+  @doc type: :validator
+  def validate_hostname({:ok, url}, %{hostnames: hostnames} = _state, _opts) do
     case URI.parse(url) do
       %URI{host: nil} ->
         {:error, :invalid_host}
@@ -399,6 +414,7 @@ defmodule Hop do
   If the given server does not support HEAD requests, it will simply
   accept the URL as valid.
   """
+  @doc type: :validator
   def validate_content({:ok, url}, _state, opts) do
     accepted_mime_types = opts[:accepted_mime_types]
     max_content_length = opts[:max_content_length]
@@ -440,6 +456,7 @@ defmodule Hop do
       * `:crawl_fragment?` - whether or not to treat fragments as
       unique links to crawl. Defaults to `false`  
   """
+  @doc type: :html
   def fetch_links(url, body, opts \\ []) do
     opts = Keyword.validate!(opts, crawl_query?: true, crawl_fragment?: false)
     crawl_query? = opts[:crawl_query?]
@@ -464,12 +481,15 @@ defmodule Hop do
     end
   end
 
-  ## Other Helpers
+  ## State Manipulation
 
   @doc """
-  Marks the given URL as visited in the given state and marks
-  it as the last crawled URL.
+  Marks the given URL as visited.
+
+  This will update the set of visited URLs, and also mark this URL
+  as the last crawled URL in the state struct.
   """
+  @doc type: :state
   def visit(%State{visited: visited} = state, url) do
     %{state | visited: MapSet.put(visited, url), last_crawled_url: url}
   end

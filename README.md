@@ -1,10 +1,20 @@
 # Hop
 
+[![Package](https://img.shields.io/badge/-Package-important)](https://hex.pm/packages/hop) [![Documentation](https://img.shields.io/badge/-Documentation-blueviolet)](https://hexdocs.pm/hop)
+
 Hop is a tiny web crawling framework for Elixir.
 
 ## Installation
 
-Coming soon.
+Hop is [available in Hex](https://hex.pm/packages/hop):
+
+```elixir
+defp deps do
+  [
+    {:hop, "~> 0.1"}
+  ]
+end
+```
 
 ## Introduction
 
