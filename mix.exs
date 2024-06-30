@@ -37,6 +37,10 @@ defmodule Hop.MixProject do
     [
       {:req, "~> 0.5"},
       {:floki, ">= 0.30.0"},
+      {:req_crawl, "~> 0.2.0"},
+      {:bandit, "~> 1.0", only: :test},
+      {:plug, "~> 1.16", only: :test},
+      {:temple, "~> 0.12", only: :test},
       {:ex_doc, "~> 0.23", only: :docs}
     ]
   end

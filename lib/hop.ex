@@ -46,7 +46,7 @@ defmodule Hop do
     3. Check that the host is actually valid, using `:inet.gethostbyname`
 
     4. Check that the host is an acceptable host to visit, e.g. not outside of
-    the host the crawl started on.
+    the host the crawl started on, or not allowed according to the host robots.txt.
 
     5. Perform a HEAD request to check that the content-length does not exceed
     the maximum specified content length and to check that the content-type matches
@@ -68,7 +68,7 @@ defmodule Hop do
 
   Your custom `prefetch/3` function should be an arity-3 function which takes a URL, the
   current Crawl state, and the current Hop's configuration options as input and returns
-  `{:ok, url}` or an error value. Any none `{:ok, url}` values will be ignored during fetch.
+  `{:ok, url, state}` or an error value. Any none `{:ok, url}` values will be ignored during fetch.
 
   ### Fetch
 
@@ -118,7 +118,7 @@ defmodule Hop do
       end
 
   This simple example ignores all URLs that contain `wp-uploads`. Hop provides a convenience
-  `fetch_links/2` to fetch all of the absolute URLs on a webpage. This just uses Floki under-the-hood. 
+  `fetch_links/2` to fetch all of the absolute URLs on a webpage. This just uses Floki under-the-hood.
   """
   @default_max_depth 5
   @default_max_content_length 1_000_000_000
@@ -142,6 +142,10 @@ defmodule Hop do
     :req_options
   ]
 
+  # This is what is set as default by Req
+  # To avoid running the `put_user_agent` step, we just set it here
+  @default_user_agent "req/0.5.1"
+
   alias __MODULE__, as: Hop
 
   defstruct [:url, :prefetch, :fetch, :next, :config]
@@ -152,10 +156,12 @@ defmodule Hop do
     @moduledoc false
 
     defstruct [
+      :req,
       :last_crawled_url,
       depth: 0,
       visited: MapSet.new(),
       hostnames: MapSet.new(),
+      robots: %{},
       state: %{}
     ]
   end
@@ -167,34 +173,32 @@ defmodule Hop do
   """
   @doc type: :builder
   def new(url, opts \\ []) when is_binary(url) or is_list(url) do
-    opts = Keyword.validate!(opts, [:prefetch, :fetch, :next, :config])
+    default_conf = Enum.map(@config_keys, fn key -> {key, default_config(key)} end)
 
-    opts
-    |> Enum.into(default_hop(url))
-    |> then(&struct(Hop, &1))
-  end
-
-  defp default_hop(url) do
-    %{
-      url: url,
+    Keyword.validate!(opts,
       prefetch: &default_prefetch/3,
       fetch: &default_fetch/3,
       next: &default_next/4,
-      config: Enum.map(@config_keys, fn key -> {key, default_config(key)} end)
-    }
+      config: default_conf
+    )
+    |> Keyword.update!(:config, fn conf ->
+      deep_merge_kw(default_conf, conf)
+    end)
+    |> Keyword.put_new(:url, url)
+    |> then(&struct(Hop, &1))
   end
 
   defp default_prefetch(url, state, opts) do
     {:ok, url}
     |> validate_hostname(state, opts)
     |> validate_scheme(state, opts)
+    |> validate_robots(state, opts)
     |> validate_content(state, opts)
+    |> then(&{elem(&1, 0), elem(&1, 1), state})
   end
 
-  defp default_fetch(url, state, opts) do
-    req_options = opts[:req_options]
-
-    with {:ok, response} <- Req.get(url, req_options) do
+  defp default_fetch(url, %State{req: req} = state, _opts) do
+    with {:ok, response} <- Req.get(req, url: url) do
       {:ok, response, state}
     end
   end
@@ -297,10 +301,30 @@ defmodule Hop do
     max_depth = config(hop, :max_depth)
 
     urls = List.wrap(url)
+
     hostnames = Enum.reduce(urls, state.hostnames, &MapSet.put(&2, hostname(&1)))
 
     state = %{state | hostnames: hostnames}
     start = Enum.map(urls, &{&1, 0})
+
+    req =
+      hop
+      |> config(:req_options)
+      |> Req.new()
+      |> ReqCrawl.Robots.attach()
+
+    robots =
+      Enum.into(hostnames, %{}, fn hostname ->
+        case Req.get(req, url: URI.merge(hostname, "/robots.txt")) do
+          {:ok, %Req.Response{private: %{crawl_robots: robots}}} ->
+            {hostname, robots}
+
+          _ ->
+            {hostname, nil}
+        end
+      end)
+
+    state = %{state | req: req, robots: robots}
 
     Stream.unfold({start, state}, fn {urls, state} ->
       {_visited, leftover} =
@@ -327,7 +351,7 @@ defmodule Hop do
   end
 
   defp do_visit(%Hop{config: config} = hop, url, state) do
-    with {:ok, url} <- hop.prefetch.(url, state, config),
+    with {:ok, url, state} <- hop.prefetch.(url, state, config),
          {:ok, response, state} <- hop.fetch.(url, state, config),
          {:ok, links, state} <- hop.next.(url, response, state, config) do
       {response, links, state}
@@ -384,7 +408,11 @@ defmodule Hop do
   the set of hostnames allowed according to the crawl state.
   """
   @doc type: :validator
-  def validate_hostname({:ok, url}, %{hostnames: hostnames} = _state, _opts) do
+  def validate_hostname(
+        {:ok, url},
+        %State{hostnames: hostnames} = _state,
+        _opts
+      ) do
     case URI.parse(url) do
       %URI{host: nil} ->
         {:error, :invalid_host}
@@ -392,7 +420,10 @@ defmodule Hop do
       %URI{host: host} ->
         case :inet.gethostbyname(to_charlist(host)) do
           {:ok, _} ->
-            if MapSet.member?(hostnames, hostname(url)) do
+            if MapSet.member?(
+                 hostnames,
+                 hostname(url)
+               ) do
               {:ok, url}
             else
               {:error, :invalid_host}
@@ -402,6 +433,42 @@ defmodule Hop do
   end
 
   def validate_hostname(value, _state, _opts), do: value
+
+  def validate_robots({:ok, url}, %State{req: req, robots: robots}, _opts) do
+    hostname = hostname(url)
+
+    unless Map.has_key?(robots, hostname) do
+      {:error, :robots_not_found}
+    else
+      %{rules: rules} = Map.fetch!(robots, hostname)
+      user_agent = Req.Request.get_option(req, :user_agent, @default_user_agent)
+
+      rules_for_agent = Map.get(rules, user_agent, Map.get(rules, "*", %{}))
+
+      parsed_url = URI.parse(url)
+      path_with_query = "#{parsed_url.path}?#{parsed_url.query}"
+
+      normalized_path =
+        if String.ends_with?(path_with_query, "/"),
+          do: path_with_query,
+          else: path_with_query <> "/"
+
+      disallowed =
+        Map.has_key?(rules_for_agent, :disallow) &&
+          any_match?(normalized_path, rules_for_agent.disallow)
+
+      allowed =
+        Map.has_key?(rules_for_agent, :allow) &&
+          any_match?(normalized_path, rules_for_agent.allow)
+
+      if allowed or not disallowed,
+        do: {:ok, url},
+        else: {:error, :disallowed_by_robots}
+    end
+  end
+
+  def validate_robots(_value, _state, _opts),
+    do: {:error, :robots_not_found}
 
   @doc """
   Validates that the given URL's content is valid for the crawl.
@@ -415,14 +482,30 @@ defmodule Hop do
   accept the URL as valid.
   """
   @doc type: :validator
-  def validate_content({:ok, url}, _state, opts) do
+  def validate_content({:ok, url}, %State{req: req}, opts) do
     accepted_mime_types = opts[:accepted_mime_types]
     max_content_length = opts[:max_content_length]
 
-    case Req.head(url, retry: false) do
+    case Req.head(req, url: url, retry: false) do
       {:ok, %{status: status, headers: headers}} when status in 200..299 ->
         content_type = Map.get(headers, "Content-Type") || Map.get(headers, "content-type")
-        content_length = Map.get(headers, "Content-Length") || Map.get(headers, "Content-Length")
+
+        content_length =
+          case Map.get(headers, "Content-Length") || Map.get(headers, "content-length") do
+            [single] ->
+              single
+
+            [head | _rest] ->
+              head
+
+            single ->
+              single
+          end
+
+        content_length =
+          if is_binary(content_length),
+            do: Integer.parse(content_length) |> elem(0),
+            else: content_length
 
         cond do
           not accept_mime_type?(content_type, accepted_mime_types) ->
@@ -454,7 +537,7 @@ defmodule Hop do
       as unique links to crawl. Defaults to `true`
 
       * `:crawl_fragment?` - whether or not to treat fragments as
-      unique links to crawl. Defaults to `false`  
+      unique links to crawl. Defaults to `false`
   """
   @doc type: :html
   def fetch_links(url, body, opts \\ []) do
@@ -508,15 +591,53 @@ defmodule Hop do
   defp accept_content_length?(nil, _), do: true
 
   defp accept_content_length?(content_length, max_content_length) do
-    content_length <= max_content_length
+    content_length |> IO.inspect() <= max_content_length
   end
 
   defp hostname(url) do
-    if host = URI.parse(url).host do
-      case String.split(host, ".") do
-        [_host, _tld] = split_host -> Enum.join(split_host, ".")
-        [_sub | rest] -> Enum.join(rest, ".")
-      end
+    with %URI{} = uri = URI.parse(url),
+         host = uri.host do
+      hostnm =
+        case String.split(host, ".") do
+          [single] -> single
+          [_host, _tld] = split_host -> Enum.join(split_host, ".")
+          [_sub | rest] -> Enum.join(rest, ".")
+        end
+
+      %{uri | host: hostnm, path: nil, query: nil, fragment: nil}
     end
+  end
+
+  defp any_match?(path, patterns) do
+    Enum.any?(patterns, fn pattern ->
+      regex = build_regex(pattern)
+      Regex.match?(regex, path)
+    end)
+  end
+
+  defp build_regex(pattern) do
+    pattern
+    |> Regex.escape()
+    |> String.replace("\\*", ".*")
+    |> String.replace("\\$", "$")
+    |> Regex.compile!()
+  end
+
+  defp deep_merge_kw(a, b, ignore_set \\ []) do
+    Keyword.merge(a, b, fn
+      _key, val_a, val_b when is_list(val_a) and is_list(val_b) ->
+        deep_merge_kw(val_a, val_b)
+
+      key, val_a, val_b ->
+        if Keyword.has_key?(b, key) do
+          if Keyword.has_key?(ignore_set, key) and Keyword.get(ignore_set, key) == val_b do
+            val_a
+          else
+            val_b
+          end
+        else
+          val_a
+        end
+    end)
   end
 end
