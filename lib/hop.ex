@@ -385,19 +385,13 @@ defmodule Hop do
   """
   @doc type: :validator
   def validate_hostname({:ok, url}, %{hostnames: hostnames} = _state, _opts) do
-    case URI.parse(url) do
-      %URI{host: nil} ->
+    with %URI{host: host} <- URI.parse(url),
+         {:ok, _} <- :inet.gethostbyname(to_charlist(host)),
+         true <- MapSet.member?(hostnames, hostname(url)) do
+      {:ok, url}
+    else
+      _ ->
         {:error, :invalid_host}
-
-      %URI{host: host} ->
-        case :inet.gethostbyname(to_charlist(host)) do
-          {:ok, _} ->
-            if MapSet.member?(hostnames, hostname(url)) do
-              {:ok, url}
-            else
-              {:error, :invalid_host}
-            end
-        end
     end
   end
 
